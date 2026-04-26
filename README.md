@@ -3,14 +3,6 @@
 Real HP values for Kronos, the TrinityCore-based 1.12 private server,
 when played through a modern WoW Classic Era client (Interface 11402).
 
-Kronos only sends real `UnitHealth` / `UnitHealthMax` for **friendly
-party/raid units**. Targets, mouseover, nameplates, enemy players and
-all NPCs come through as 0–100 percentages with `UnitHealthMax ≈ 100`.
-MobHealth3 fills the gap: a 10K-entry static DB for known NPCs and a
-combat-log accumulator for everyone else, surfaced as a transparent
-override of the global `UnitHealth` / `UnitHealthMax` so every other
-addon picks up real values without modification.
-
 ---
 
 ## Features
