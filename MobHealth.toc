@@ -1,0 +1,10 @@
+## Interface: 11402
+## Author: Neronix & PapaRogue - Updated to K4 and DB restore by Mirasu - Modernized for 1.14.x
+## Title: MobHealth3 Kronos Edition
+## Version: 4.0
+## OptionalDeps: pfUI, MobInfo2, LunaUnitFrames
+## Notes: Exact mob health for Kronos (TrinityCore 1.12) on the modern client.
+## SavedVariables: MobHealth3SavedDB
+
+MobHealth3.lua
+Data.lua
