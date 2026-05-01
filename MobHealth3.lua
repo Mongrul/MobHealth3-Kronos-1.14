@@ -404,88 +404,66 @@ MobHealth3:SetScript("OnEvent", function(self, event, arg1)
         onCombatLogEvent()
     elseif event == "PLAYER_LOGIN" then
         DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Kronos edition loaded.")
-        installBridges()
-    end
-end)
-
-----------------------------------------------------------------
--- Target frame text overlay (throttled to ~5/sec)
-----------------------------------------------------------------
-local throttle = 0
-MobHealth3:SetScript("OnUpdate", function(self, elapsed)
-    throttle = throttle + elapsed
-    if throttle < 0.2 then return end
-    throttle = 0
-
-    if TargetFrame and TargetFrame:IsVisible() then
-        local c, m, found = MobHealth3:GetUnitHealth("target")
-        if found then
-            if not MH3_TargetOverlay then
-                MH3_TargetOverlay = TargetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-                MH3_TargetOverlay:SetPoint("CENTER", TargetFrame, "TOPLEFT", 150, -38)
-            end
-            MH3_TargetOverlay:SetText(c .. " / " .. m)
-            MH3_TargetOverlay:Show()
-
-            -- Force-sync TargetFrameHealthBar's range, but only when it
-            -- actually disagrees with the bridge. Blizzard never fires
-            -- UNIT_MAXHEALTH for percentage-only targets (server max stays
-            -- at 100), so switching from a friendly (max=4724) to a
-            -- percentage target (max=100) leaves the bar's range stuck and
-            -- SetValue gets clamped. Repairing on every tick would race
-            -- with Blizzard's text-update flow and drown out EasyFrames'
-            -- hook on TextStatusBar_UpdateTextString — only intervene when
-            -- a fix is actually needed.
-            if TargetFrameHealthBar and TargetFrameHealthBar.unit == "target" then
-                local _, currentMax = TargetFrameHealthBar:GetMinMaxValues()
-                if math.abs((currentMax or 0) - m) > 0.5 then
-                    TargetFrameHealthBar:SetMinMaxValues(0, m)
-                end
-                if math.abs((TargetFrameHealthBar:GetValue() or 0) - c) > 0.5 then
-                    TargetFrameHealthBar:SetValue(c)
-                end
-                -- Force a text refresh. Blizzard only fires
-                -- TextStatusBar_UpdateTextString from UNIT_HEALTH events,
-                -- and those are unreliable in 2-box / cross-client scenarios
-                -- (party member's HP changes on the other client don't
-                -- always wake an event on this one). Calling it manually
-                -- triggers EasyFrames' SecureHook so its formatted text
-                -- re-reads UnitHealth via our bridge.
-                if TextStatusBar_UpdateTextString then
-                    TextStatusBar_UpdateTextString(TargetFrameHealthBar)
-                end
-            end
-        elseif MH3_TargetOverlay then
-            MH3_TargetOverlay:Hide()
-        end
-    end
-
-    -- Sync default Blizzard nameplate bars. Same problem as TargetFrame:
-    -- Blizzard updates SetValue on UNIT_HEALTH but only refreshes the
-    -- range on UNIT_MAXHEALTH (which never fires for percentage units),
-    -- so SetValue(3277) on a (0, 100) bar clamps to full and the plate
-    -- looks stuck. Bridged values keep cur/max in proportion.
-    if C_NamePlate and C_NamePlate.GetNamePlates then
-        for _, plate in pairs(C_NamePlate.GetNamePlates()) do
-            local frame = plate.UnitFrame
-            if frame and frame.unit then
-                local hb = frame.healthBar or frame.HealthBar
-                if hb then
-                    local pc, pm, pfound = MobHealth3:GetUnitHealth(frame.unit)
-                    if pfound then
-                        local _, plateMax = hb:GetMinMaxValues()
-                        if math.abs((plateMax or 0) - pm) > 0.5 then
-                            hb:SetMinMaxValues(0, pm)
-                        end
-                        if math.abs((hb:GetValue() or 0) - pc) > 0.5 then
-                            hb:SetValue(pc)
+        -- Permanently neutralize the diagnostic overlay from older versions.
+        -- It's an unnamed OVERLAY-layer FontString parented somewhere under
+        -- TargetFrame. Hide() alone gets undone by some upstream code on
+        -- the next frame, so layer multiple defenses: empty the text, set
+        -- alpha to 0, shrink to 1×1, and re-anchor far offscreen. Even if
+        -- something Shows() it again it has nothing visible to display.
+        -- EasyFrames' TextString is on the ARTWORK layer so it's untouched.
+        local function killOverlayOrphans(frame, depth)
+            if depth > 6 then return end
+            if frame.GetRegions then
+                for _, region in ipairs({frame:GetRegions()}) do
+                    if region.GetObjectType
+                       and region:GetObjectType() == "FontString"
+                       and not region:GetName()
+                       and region.GetDrawLayer
+                       and region:GetDrawLayer() == "OVERLAY" then
+                        local txt = region:GetText() or ""
+                        if txt:find("/") then
+                            region:SetText("")
+                            region:SetAlpha(0)
+                            region:SetWidth(1)
+                            region:SetHeight(1)
+                            region:ClearAllPoints()
+                            region:SetPoint("CENTER", UIParent, "BOTTOMLEFT", -9999, -9999)
+                            region:Hide()
                         end
                     end
                 end
             end
+            if frame.GetChildren then
+                for _, child in ipairs({frame:GetChildren()}) do
+                    killOverlayOrphans(child, depth + 1)
+                end
+            end
         end
+        if TargetFrame then killOverlayOrphans(TargetFrame, 0) end
+
+        -- Also neutralize the named MobHealth3TargetText FontString from
+        -- previous versions that experimented with a centered overlay on
+        -- the bar. EasyFrames provides target numbers when the user has
+        -- Blizzard's status text option enabled — we don't want to double
+        -- them up.
+        if _G.MobHealth3TargetText then
+            _G.MobHealth3TargetText:SetText("")
+            _G.MobHealth3TargetText:SetAlpha(0)
+            _G.MobHealth3TargetText:Hide()
+        end
+
+        installBridges()
     end
 end)
+
+-- No OnUpdate by design. We previously force-synced TargetFrameHealthBar's
+-- range/value and Blizzard nameplate bars from a 5/sec OnUpdate, but those
+-- insecure writes tainted the TargetFrame chain — Blizzard's stock
+-- TargetFrame_OnUpdate propagates that taint into TargetofTarget_Update
+-- and the protected TargetFrameToT:Show() gets blocked, breaking ToT.
+-- Bar fills end up correct anyway because the bridge keeps cur/max in
+-- proportion whether max is 100 (raw percentage) or 4800 (estimated real),
+-- and frame addons read UnitHealth via the global override for text.
 
 ----------------------------------------------------------------
 -- Legacy public API (MobHealth / MobHealth2 contracts)
@@ -543,55 +521,198 @@ local function bridgedHealthMax(unit)
     return max
 end
 
+-- Per-function patcher. Replaces UnitHealth / UnitHealthMax inside one
+-- specific function via setfenv, so callers of that function see bridged
+-- values without us touching the global table. The wrapping metatable
+-- delegates everything else (other globals, locals) to the original env.
+local function patchAddonFunc(fn)
+    if type(fn) ~= "function" then return end
+    local env = getfenv(fn)
+    if type(env) ~= "table" then return end
+    local newEnv = setmetatable({
+        UnitHealth    = bridgedHealth,
+        UnitHealthMax = bridgedHealthMax,
+    }, {__index = env})
+    pcall(setfenv, fn, newEnv)
+end
+
+-- Tag-environment patcher for addons whose loadstring'd tags are
+-- setfenv'd to a private env table (Luna, SUF). Writing UnitHealth
+-- directly on the env shadows the env's `__index = _G` fallback for
+-- every tag that shares the env.
+--
+-- IMPORTANT: use rawset, not direct assignment. SUF's TagEnv has a
+-- `__newindex` metamethod that silently redirects writes to `_G` —
+-- which is precisely the global-override-tainting behavior we need
+-- to avoid. rawset bypasses `__newindex` and writes directly to the
+-- env table, so the bridge is local to that env only.
+local function patchTagEnv(tagFn)
+    if type(tagFn) ~= "function" then return nil end
+    local env = getfenv(tagFn)
+    if type(env) ~= "table" then return nil end
+    rawset(env, "UnitHealth",    bridgedHealth)
+    rawset(env, "UnitHealthMax", bridgedHealthMax)
+    return env
+end
+
 local bridgesInstalled = false
 installBridges = function()
     if bridgesInstalled then return end
 
-    -- 1. GLOBAL OVERRIDE: catches everything that does global UnitHealth
-    -- lookups at call time (Blizzard frames, EasyFrames, Kui, etc.).
-    _G.UnitHealth    = bridgedHealth
-    _G.UnitHealthMax = bridgedHealthMax
-
-    -- 2. oUF / Luna direct-ref entries. The tag table grabs C-function
-    -- references at file load and the global replace doesn't reach them.
-    if oUF and oUF.Tags and oUF.Tags.Methods then
-        local methods = oUF.Tags.Methods
-        methods.curhp = bridgedHealth
-        methods.maxhp = bridgedHealthMax
-        if oUF.Tags.RefreshMethods then
-            oUF.Tags:RefreshMethods("curhp")
-            oUF.Tags:RefreshMethods("maxhp")
-            oUF.Tags:RefreshMethods("perhp")
-            oUF.Tags:RefreshMethods("missinghp")
-        end
-    end
-
-    -- 3. pfUI fork that exposes its own tag table.
-    if pfUI and pfUI.api and pfUI.api.tags then
-        pfUI.api.tags["curhp"] = bridgedHealth
-        pfUI.api.tags["maxhp"] = bridgedHealthMax
-    end
-
-    -- 4. Luna's oUF_TagsWithHeal defines its own UnitHasHealthData inside
-    -- a private tag environment (`_ENV`) — it returns false for any
-    -- player you're not grouped with (duel partners, BG/world PvP enemies),
-    -- which forces smarthealth into the "X%" branch and hides the real
-    -- numbers our bridge produces. Reach into that env via getfenv on a
-    -- compiled tag and override it. _PROXY and _ENV are the same table,
-    -- so the patch lands on every tag that shares the env.
+    -- We deliberately do NOT replace _G.UnitHealth / _G.UnitHealthMax.
+    -- Blizzard's secure TargetFrame_OnUpdate calls UnitHealth on every
+    -- frame; if the global points at our insecure wrapper, the entire
+    -- secure call chain becomes tainted and Blizzard's protected
+    -- TargetFrameToT:Show() gets blocked, breaking ToT in combat.
+    -- Instead we detect the user's primary unit-frame addon and patch
+    -- *only that one*. Bridged values stay inside that addon's own
+    -- (insecure) execution and never leak into Blizzard's secure chain.
     --
-    -- NB: Luna's oUF is namespace-private (`LUF.oUF`, not `_G.oUF`); the
-    -- TagsWithHeal table lives at `LUF.oUF.TagsWithHeal`. Fall back to a
-    -- bare `oUF` global for other oUF forks that do expose it.
+    -- Priority order (a typical user runs one of these as their primary):
+    --   Luna  >  ShadowedUnitFrames  >  pfUI  >  EasyFrames  >  (none)
+    -- The first match installs and we stop. If the user has none of
+    -- these, no bridge is installed and addons see raw server values.
+
+    local bridged
+
     local lunaOUF = (LUF and LUF.oUF) or oUF
     if lunaOUF and lunaOUF.TagsWithHeal and lunaOUF.TagsWithHeal.Methods then
-        local probe = lunaOUF.TagsWithHeal.Methods.smarthealth  -- force lazy compile
-        if type(probe) == "function" then
-            local env = getfenv(probe)
-            if type(env) == "table" then
-                env.UnitHasHealthData = function() return true end
+        -- Luna Unit Frames: patch the shared TagsWithHeal env so every
+        -- HP tag (smarthealth, curhp, maxhp, perhp, etc.) resolves
+        -- UnitHealth through our bridge. Also force UnitHasHealthData
+        -- true so duel partners / BG-PvP enemies show real numbers
+        -- instead of falling into the "X%" branch.
+        local env = patchTagEnv(lunaOUF.TagsWithHeal.Methods.smarthealth)
+        if env then
+            env.UnitHasHealthData = function() return true end
+            bridged = "Luna Unit Frames"
+        end
+    end
+
+    if not bridged and ShadowUF then
+        -- ShadowedUnitFrames: patch its private TagEnv (used for all
+        -- loadstring'd tag display) plus the Health module's Update
+        -- (which sets the bar fill itself).
+        --
+        -- Timing: SUF's tagFunc metamethod can return `false` at
+        -- PLAYER_LOGIN if the defaultTags table from modules/tags.lua
+        -- isn't wired in yet. We try immediately and also schedule a
+        -- delayed retry; rawset is idempotent so re-running is safe.
+        local function applySUFPatch()
+            if ShadowUF.tagFunc then
+                patchTagEnv(ShadowUF.tagFunc.maxhp)
+            end
+            if ShadowUF.modules and ShadowUF.modules.healthBar then
+                patchAddonFunc(ShadowUF.modules.healthBar.Update)
             end
         end
+        applySUFPatch()
+        if C_Timer and C_Timer.After then
+            C_Timer.After(2, applySUFPatch)
+        end
+        bridged = "ShadowedUnitFrames"
+    end
+
+    if not bridged and pfUI and pfUI.api and pfUI.api.tags then
+        -- pfUI: direct tag-table assignment, also expose the static DB.
+        pfUI.api.tags["curhp"] = bridgedHealth
+        pfUI.api.tags["maxhp"] = bridgedHealthMax
+        bridged = "pfUI"
+    end
+
+    if not bridged and IsAddOnLoaded and IsAddOnLoaded("ModernTargetFrame") then
+        -- ModernTargetFrame: SDPhantom's re-skin creates Blizzard-style
+        -- TextString/LeftText/RightText FontStrings on TargetFrameHealthBar
+        -- and TargetFrameManaBar, then leans on Blizzard's stock
+        -- TextStatusBar_UpdateTextString to populate them. The bar's
+        -- numeric value comes from UnitHealth (server percentage), so the
+        -- default text reads "75 / 100" for percentage-only targets.
+        --
+        -- Post-hook the update function and rewrite the text widgets with
+        -- our bridged values. hooksecurefunc is taint-safe — the hook
+        -- runs in insecure context after Blizzard's secure call returns,
+        -- so SetText on the FontStrings (which aren't protected widgets)
+        -- doesn't leak back into Blizzard's chain.
+        local function substituteText(bar)
+            if not bar or bar ~= TargetFrameHealthBar or not bar.unit then return end
+            local c, m, found = MobHealth3:GetUnitHealth(bar.unit)
+            if not found then return end
+            if bar.TextString then bar.TextString:SetText(c .. " / " .. m) end
+            if bar.LeftText  then bar.LeftText:SetText(c) end
+            if bar.RightText then bar.RightText:SetText(m) end
+        end
+        if hooksecurefunc then
+            hooksecurefunc("TextStatusBar_UpdateTextString", substituteText)
+        end
+        bridged = "ModernTargetFrame"
+    end
+
+    if not bridged and IsAddOnLoaded and IsAddOnLoaded("EasyFrames") then
+        -- EasyFrames: registers itself via Ace3 (NewAddon) — it's a local
+        -- in its own file, not a global. Fetch via LibStub. Then patch
+        -- the text formatter via setfenv. The hook runs in post-hook
+        -- (insecure) context so bridge calls don't leak taint into
+        -- Blizzard's secure chain.
+        local EF = LibStub
+            and LibStub("AceAddon-3.0", true)
+            and LibStub("AceAddon-3.0"):GetAddon("EasyFrames", true)
+        if EF and EF.Utils then
+            patchAddonFunc(EF.Utils.UpdateHealthValues)
+            patchAddonFunc(EF.Utils.UpdateManaValues)
+            bridged = "EasyFrames"
+        end
+    end
+
+    if not bridged and TargetFrameHealthBar then
+        -- Stock Blizzard fallback. Classic Era's TargetFrameHealthBar has
+        -- no built-in text widget, so we create one and drive it from
+        -- UNIT_HEALTH / PLAYER_TARGET_CHANGED events. Visibility is gated
+        -- on the user's `statusText` cvar so the addon respects the
+        -- "Status Text" Interface option instead of forcing numbers.
+        local container = CreateFrame("Frame", nil, TargetFrame)
+        container:SetAllPoints(TargetFrameHealthBar)
+        container:SetFrameLevel(TargetFrameHealthBar:GetFrameLevel() + 5)
+        local fs = container:CreateFontString(
+            "MobHealth3StockTargetText", "OVERLAY", "GameFontHighlightSmall")
+        fs:SetPoint("CENTER", container, "CENTER", 0, 0)
+
+        local function refresh()
+            local cvar = GetCVar and GetCVar("statusText")
+            if cvar ~= "1" or not UnitExists("target") then
+                fs:SetText("")
+                return
+            end
+            local c, m, found = MobHealth3:GetUnitHealth("target")
+            if found then
+                fs:SetText(c .. " / " .. m)
+            else
+                fs:SetText("")
+            end
+        end
+
+        local watcher = CreateFrame("Frame")
+        watcher:RegisterEvent("PLAYER_TARGET_CHANGED")
+        watcher:RegisterEvent("UNIT_HEALTH")
+        watcher:RegisterEvent("UNIT_MAXHEALTH")
+        watcher:RegisterEvent("CVAR_UPDATE")
+        watcher:SetScript("OnEvent", function(_, event, arg1)
+            if event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH" then
+                if arg1 ~= "target" then return end
+            end
+            refresh()
+        end)
+        refresh()
+
+        bridged = "stock Blizzard frames"
+    end
+
+    if bridged then
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff00ff00MobHealth3:|r bridge active for " .. bridged .. ".")
+    else
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff00ff00MobHealth3:|r no target frame available; values " ..
+            "will pass through unbridged.")
     end
 
     bridgesInstalled = true

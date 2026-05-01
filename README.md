@@ -32,6 +32,10 @@ when played through a modern WoW Classic Era client (Interface 11402).
 - **O(1) name lookup.** A lazily-built name index replaces the original
   O(N) `pairs()` scan over Data.lua, making the addon viable in 80v80
   PvP where every visible enemy triggers DB lookups every frame.
+- **Frame and nameplate sync** — keeps the default Blizzard target
+  frame bar's range and value synced to bridged values so 2-box /
+  cross-client scenarios don't leave the bar stuck. Same treatment for
+  Blizzard nameplates via `C_NamePlate.GetNamePlates()`.
 - **Self-target / pet / party / raid handling.** Indirect tokens like
   `target` are resolved via `UnitIsUnit` / `UnitInParty` so targeting
   yourself or a party member shows real HP straight from the server,
@@ -126,6 +130,10 @@ The bridge replaces `_G.UnitHealth` / `_G.UnitHealthMax` once at
 - **Players and unlisted NPCs need ~5% of damage / healing observed**
   before the estimator switches from percent fallback to real values.
   Snapshots remove this delay on re-engagement.
+- **Cross-client 2-boxing** can leave the bar's value stale because
+  Blizzard's `UNIT_HEALTH` events don't always fire on the watching
+  client. The OnUpdate loop refreshes the target frame and nameplate
+  bars every 0.2s to compensate.
 - **Mana / resource bars are not bridged.** Kronos uses the same
   percentage trick for power values for non-friendly units; the same
   approach would extend to those but isn't currently implemented.
@@ -133,4 +141,3 @@ The bridge replaces `_G.UnitHealth` / `_G.UnitHealthMax` once at
 ## Acknowledgments
 
 Maintained by **Mirasu of Kronos**.
-
