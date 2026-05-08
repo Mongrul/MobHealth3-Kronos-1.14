@@ -608,7 +608,7 @@ installBridges = function()
         end
         applySUFPatch()
         if C_Timer and C_Timer.After then
-            C_Timer.After(2, applySUFPatch)
+            C_Timer.After(1, applySUFPatch)
         end
         bridged = "ShadowedUnitFrames"
     end
@@ -706,14 +706,270 @@ installBridges = function()
         bridged = "stock Blizzard frames"
     end
 
-    if bridged then
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff00ff00MobHealth3:|r bridge active for " .. bridged .. ".")
-    else
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff00ff00MobHealth3:|r no target frame available; values " ..
-            "will pass through unbridged.")
+    -- ElvUI: bundles its own oUF fork at E.oUF (= ElvUF). Tags.lua does
+    -- `local UnitHealth = UnitHealth` at chunk load, so each tag closure
+    -- captures UnitHealth as an upvalue. WoW Classic Era doesn't expose
+    -- the `debug` library, so we can't reach into those upvalues.
+    -- Bar fill is correct without bridging anyway — the percent ratio
+    -- 75/100 fills identically to 9000/12000 — so the only thing we need
+    -- to bridge is the displayed health text. Done by replacing each
+    -- standard health tag in ElvUF.Tags.Methods with a from-scratch
+    -- implementation that calls bridgedHealth/bridgedHealthMax, then
+    -- invalidating ElvUI's tagPool/funcPool caches so already-compiled
+    -- tagstrings (bound during ElvUI:OnInitialize) pick up the
+    -- replacements.
+    --
+    -- Runs parallel to the priority chain — Luna + ElvUI loaded
+    -- together is harmless since each addon's bridge stays in its own
+    -- private tables/closures. pcall'd so unexpected ElvUI internal
+    -- changes don't break the rest of installBridges.
+    local elvOk, elvErr = pcall(function()
+        if not (IsAddOnLoaded and IsAddOnLoaded("ElvUI") and _G.ElvUI) then return end
+        local E = _G.ElvUI[1]
+        local ElvUF = E and E.oUF
+        if not ElvUF then return end
+
+        if ElvUF.Tags and ElvUF.Tags.Methods and E.GetFormattedTextStyles then
+            local Methods = ElvUF.Tags.Methods
+            local lc, gsub = string.lower, string.gsub
+            local UnitIsDead      = _G.UnitIsDead
+            local UnitIsGhost     = _G.UnitIsGhost
+            local UnitIsConnected = _G.UnitIsConnected
+            local DEAD    = _G.DEAD or "Dead"
+            local GHOST   = "Ghost"
+            local OFFLINE = "Offline"
+
+            local function makeHealthTag(textFormat, withStatus, short)
+                return function(unit)
+                    if withStatus then
+                        if UnitIsDead(unit)            then return DEAD    end
+                        if UnitIsGhost(unit)           then return GHOST   end
+                        if not UnitIsConnected(unit)   then return OFFLINE end
+                    end
+                    return E:GetFormattedText(textFormat,
+                        bridgedHealth(unit), bridgedHealthMax(unit),
+                        nil, short)
+                end
+            end
+
+            local replaced = {}
+            for textFormat in pairs(E.GetFormattedTextStyles) do
+                local tagFormat = lc(gsub(textFormat, '_', '-'))
+                local names = {
+                    ['health:'..tagFormat]                       = {true,  false},
+                    ['health:'..tagFormat..'-nostatus']          = {false, false},
+                }
+                if tagFormat ~= 'percent' then
+                    names['health:'..tagFormat..':shortvalue']           = {true,  true}
+                    names['health:'..tagFormat..'-nostatus:shortvalue']  = {false, true}
+                end
+                for name, opts in pairs(names) do
+                    Methods[name] = makeHealthTag(textFormat, opts[1], opts[2])
+                    replaced[name] = true
+                end
+            end
+
+            if ElvUF.Tags.RefreshMethods then
+                for tag in pairs(replaced) do
+                    pcall(ElvUF.Tags.RefreshMethods, ElvUF.Tags, tag)
+                end
+            end
+        end
+
+        bridged = bridged and (bridged .. " + ElvUI") or "ElvUI"
+    end)
+    if not elvOk then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff0000MobHealth3 ElvUI bridge error:|r " .. tostring(elvErr))
     end
+
+    -- Nameplates are an independent display layer — bridge them in
+    -- parallel with whichever unit-frame addon won the priority chain
+    -- above. NeatPlates has its own update path; sets unit.health and
+    -- unit.healthmax in `UpdateUnitCondition` then hands the unit table
+    -- to the active theme. UpdateUnitCondition is local so we can't
+    -- setfenv it; instead we wrap the active theme's OnContextUpdate
+    -- and OnUpdate callbacks (called immediately after) to overwrite
+    -- the health fields with bridged values before the theme renders.
+    local nameplateBridged
+    if NeatPlates then
+        local function wrapTheme(theme)
+            if not theme then return end
+            -- Substitute unit.health / unit.healthmax with bridged values
+            -- for whichever unit the theme is about to render. The unit
+            -- table is mutated in-place so anything the theme reads off
+            -- it (subtext, color gradient, scale) sees real numbers.
+            local function substitute(arg1, arg2)
+                local unit = arg2 or arg1  -- (extended, unit) or just (unit)
+                local id = type(unit) == "table" and unit.unitid
+                if not id then return end
+                local c, m, found = MobHealth3:GetUnitHealth(id)
+                if found then
+                    unit.health    = c
+                    unit.healthmax = m
+                end
+            end
+            local function wrap(key, sig2)
+                local orig = theme[key]
+                if type(orig) ~= "function" then return end
+                local mark = "__mh3Wrapped_" .. key
+                if theme[mark] then return end
+                theme[key] = function(a, b)
+                    substitute(a, b)
+                    return orig(a, b)
+                end
+                theme[mark] = true
+            end
+            -- OnContextUpdate / OnUpdate fire AFTER the bar/text are
+            -- already rendered for HP changes (UpdateIndicator_HealthBar
+            -- runs before activetheme.OnUpdate inside ProcessUnitChanges),
+            -- so substituting there only updates *future* renders.
+            -- SetSubText is called from UpdateIndicator_Subtext every time
+            -- the text refreshes — wrapping it makes the displayed text
+            -- read bridged values immediately. Bar fill stays correct
+            -- because the proportion (current/max) is identical whether
+            -- we use server percentages (75/100) or bridged reals (459/612).
+            wrap("OnContextUpdate")
+            wrap("OnUpdate")
+            wrap("SetSubText")
+            wrap("SetCustomText")  -- NeatPlatesHub maps HealthTextDelegate here
+        end
+
+        -- The active theme isn't reliably at NeatPlates.ActiveThemeTable
+        -- (themes loaded via NeatPlatesInternal.UseTheme bypass that
+        -- field). NeatPlates.GetTheme() returns the actual active theme
+        -- via the local `activetheme` upvalue.
+        local function applyNPWrap()
+            if NeatPlates.GetTheme then
+                wrapTheme(NeatPlates.GetTheme())
+            end
+            wrapTheme(NeatPlates.ActiveThemeTable)  -- belt-and-braces
+        end
+        applyNPWrap()
+        -- Theme + Hub setup can finish AFTER PLAYER_LOGIN; retry once the
+        -- theme has had time to register SetCustomText etc. wrapTheme is
+        -- idempotent (marker per key prevents double-wrapping).
+        if C_Timer and C_Timer.After then
+            C_Timer.After(1, applyNPWrap)
+        end
+
+        -- Catch theme switches via the public ActivateTheme entry point.
+        if hooksecurefunc and NeatPlates.ActivateTheme then
+            hooksecurefunc(NeatPlates, "ActivateTheme", function(_, theme)
+                wrapTheme(theme)
+            end)
+        end
+
+        nameplateBridged = "NeatPlates"
+    end
+
+    -- TidyPlates_ThreatPlates: reads health via _G.UnitHealth(unitid) and
+    -- writes percent values into tp_frame.unit.health / .healthmax. Bar fill
+    -- is correct (proportion preserved) but the customtext FontString shows
+    -- "75 / 100" instead of "9000 / 12000" for non-friendly units.
+    --
+    -- Addon.UpdateUnitCondition / Addon.SetCustomText live on the per-file
+    -- private `Addon = select(2, ...)` table — no public handle, can't wrap
+    -- them. Instead, instance-shadow each plate's customtext :SetText and
+    -- rewrite numeric "X / Y" patterns whose pair matches the unit's percent
+    -- values to bridged real values. "X%" tokens need no rewrite — the ratio
+    -- is identical whether values are 75/100 or 9000/12000.
+    if IsAddOnLoaded and IsAddOnLoaded("TidyPlates_ThreatPlates") then
+        -- Match TidyPlates' TruncateWestern (Localization.lua:49) so our
+        -- replacement numbers blend with adjacent percent text. CJK locales
+        -- get the western format; minor cosmetic difference for that
+        -- audience, but avoids reaching into Addon.Truncate (also private).
+        local function tpTrunc(v)
+            local av = (v >= 0 and v) or -v
+            if av >= 1e6 then return string.format("%.1fm", v / 1e6)
+            elseif av >= 1e4 then return string.format("%.1fk", v / 1e3)
+            else return string.format("%i", v) end
+        end
+
+        local wrapped = setmetatable({}, {__mode = "k"})
+
+        local function rewriteText(text, unit)
+            local id = unit and unit.unitid
+            if not id or isFriendlyRealUnit(id) then return text end
+            local pCur, pMax = unit.health, unit.healthmax
+            if not pCur or not pMax or pMax <= 0 then return text end
+            local c, m, found = MobHealth3:GetUnitHealth(id)
+            if not found or m <= 50 then return text end
+
+            -- Match "X / Y" and "X/Y". Only replace when Y == server's percent
+            -- max (≈100); guards against unrelated numbers in the string
+            -- (e.g. an absorb tag like "[1500]" on a future retail port).
+            local function repl(sep)
+                return function(a, b)
+                    if tonumber(b) ~= pMax then return nil end
+                    local na = tonumber(a)
+                    if na == pCur then
+                        return tpTrunc(c) .. sep .. tpTrunc(m)
+                    elseif na == -(pMax - pCur) then
+                        return "-" .. tpTrunc(m - c) .. sep .. tpTrunc(m)
+                    end
+                end
+            end
+            text = string.gsub(text, "(%-?%d+) / (%d+)", repl(" / "))
+            text = string.gsub(text, "(%-?%d+)/(%d+)",   repl("/"))
+            return text
+        end
+
+        local function wrapPlate(plate)
+            local tpframe = plate and plate.TPFrame
+            if not tpframe or wrapped[tpframe] then return end
+            local visual = tpframe.visual
+            local customtext = visual and visual.customtext
+            if not customtext or type(customtext.SetText) ~= "function" then
+                return
+            end
+
+            -- FontString:SetText is a metamethod; assigning to the instance
+            -- shadows the lookup (rawget hits before __index). origSetText
+            -- captured here is the metatable method — calling it bypasses
+            -- our shadow and avoids recursion.
+            local origSetText = customtext.SetText
+            customtext.SetText = function(self, text, ...)
+                if text and text ~= "" then
+                    text = rewriteText(text, tpframe.unit)
+                end
+                return origSetText(self, text, ...)
+            end
+            wrapped[tpframe] = true
+        end
+
+        -- NAME_PLATE_UNIT_ADDED fires AFTER all addons have processed
+        -- NAME_PLATE_CREATED for the same plate, so customtext is guaranteed
+        -- to exist by then. Listening to NAME_PLATE_CREATED ourselves would
+        -- race ThreatPlates' OnNewNameplate when our handler happens to run
+        -- first.
+        local tpWatcher = CreateFrame("Frame")
+        tpWatcher:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+        tpWatcher:SetScript("OnEvent", function(_, _, unitid)
+            wrapPlate(C_NamePlate.GetNamePlateForUnit(unitid))
+        end)
+
+        -- Cover plates already created before installBridges runs.
+        if C_NamePlate and C_NamePlate.GetNamePlates then
+            for _, plate in ipairs(C_NamePlate.GetNamePlates()) do
+                wrapPlate(plate)
+            end
+        end
+
+        nameplateBridged = (nameplateBridged and (nameplateBridged .. " + ThreatPlates"))
+                           or "ThreatPlates"
+    end
+
+    local msg = "|cff00ff00MobHealth3:|r "
+    if bridged and nameplateBridged then
+        msg = msg .. "bridge active for " .. bridged .. " + " .. nameplateBridged .. "."
+    elseif bridged then
+        msg = msg .. "bridge active for " .. bridged .. "."
+    elseif nameplateBridged then
+        msg = msg .. "bridge active for " .. nameplateBridged .. " (nameplates only)."
+    else
+        msg = msg .. "no supported frame addon detected; values will pass through unbridged."
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(msg)
 
     bridgesInstalled = true
 end
