@@ -959,6 +959,63 @@ installBridges = function()
                            or "ThreatPlates"
     end
 
+    -- Plater: the actual continuous health updates run inside the
+    -- DetailsFramework health bar metatable, not Plater.lua. Each
+    -- shown nameplate's healthBar has __index = DF_healthBarMetaFunctions
+    -- (a global table DF exposes for exactly this kind of override).
+    -- The relevant methods are UpdateHealth (UNIT_HEALTH event),
+    -- UpdateMaxHealth (UNIT_MAXHEALTH event), and SetUnit (initial
+    -- bind, where the bar reads UnitHealth/UnitHealthMax for the first
+    -- time). All three use env-resolved globals — no `local UnitHealth
+    -- = UnitHealth` capture — so setfenv with a wrapping table
+    -- substitutes bridged versions cleanly. Each method writes the
+    -- resolved values onto self.currentHealth / .currentHealthMax,
+    -- which Plater.UpdateLifePercentText (and user scripts) read for
+    -- display.
+    --
+    -- Also patch Plater.QuickHealthUpdate / Plater.OnUpdateHealth —
+    -- they're called from a few less-frequent paths (e.g. when a plate
+    -- first appears via NAME_PLATE_UNIT_ADDED) and also write
+    -- CurrentHealth / CurrentHealthMax (uppercase) cached fields.
+    --
+    -- Bar fill is already visually correct without bridging (proportion
+    -- preserves whether values are 75/100 or 9000/12000); the bridge is
+    -- for the displayed text and for user scripts that read absolute
+    -- HP. pcall'd so an unexpected internal change in Plater doesn't
+    -- break the install message.
+    local platerOk, platerErr = pcall(function()
+        if not (IsAddOnLoaded and IsAddOnLoaded("Plater") and _G.Plater) then return end
+        local function bridge(fn)
+            if type(fn) ~= "function" then return false end
+            local origEnv = getfenv(fn) or _G
+            setfenv(fn, setmetatable({
+                UnitHealth    = bridgedHealth,
+                UnitHealthMax = bridgedHealthMax,
+            }, {__index = origEnv}))
+            return true
+        end
+
+        local touched = false
+        local DFHealth = _G.DF_healthBarMetaFunctions
+        if DFHealth then
+            if bridge(DFHealth.UpdateHealth)    then touched = true end
+            if bridge(DFHealth.UpdateMaxHealth) then touched = true end
+            if bridge(DFHealth.SetUnit)         then touched = true end
+        end
+
+        local Plater = _G.Plater
+        if bridge(Plater.QuickHealthUpdate) then touched = true end
+        if bridge(Plater.OnUpdateHealth)    then touched = true end
+
+        if touched then
+            nameplateBridged = (nameplateBridged and (nameplateBridged .. " + Plater"))
+                               or "Plater"
+        end
+    end)
+    if not platerOk then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff0000MobHealth3 Plater bridge error:|r " .. tostring(platerErr))
+    end
+
     local msg = "|cff00ff00MobHealth3:|r "
     if bridged and nameplateBridged then
         msg = msg .. "bridge active for " .. bridged .. " + " .. nameplateBridged .. "."
