@@ -111,9 +111,15 @@ _G.MobHealth3 = MobHealth3
 -- never gets nil.
 if not _G.RealMobHealth then
     _G.RealMobHealth = {
+        -- pcall'd because any error here propagates into the caller's
+        -- event-handling chain (Kui's nameplate UpdateHealth, etc.) —
+        -- and an error during nameplate event dispatch has previously
+        -- left Kui in a broken state requiring relog. Defensive:
+        -- return raw server values on any failure so the caller still
+        -- gets a usable response.
         GetUnitHealth = function(unit)
-            local c, m, found = MobHealth3:GetUnitHealth(unit)
-            if not found then
+            local ok, c, m, found = pcall(MobHealth3.GetUnitHealth, MobHealth3, unit)
+            if not ok or not found then
                 return origUnitHealth(unit), origUnitHealthMax(unit)
             end
             return c, m
@@ -160,6 +166,15 @@ function MobHealth3:GetUnitHealth(unit, current, max, uName, uLevel)
     -- get real HP from Kronos; everyone else comes through as 0..100 with
     -- max≈100, so we can't distinguish by value alone.
     if isFriendlyRealUnit(unit) then return current, max, true end
+
+    -- UnitName / UnitLevel can return nil for transient unit tokens —
+    -- nameplate units mid-add/remove, or a unit dying between
+    -- UnitExists() and the name lookup. The concat below would throw
+    -- in that case, and the error propagating into Kui's RMH callback
+    -- has corrupted Kui's event-handler state in the past (intermittent
+    -- "needs relog" bug). Bail out with the raw values instead — caller
+    -- sees a not-bridged response, same as if we had no data.
+    if not uName or not uLevel then return current, max, false end
 
     local uKey = uName .. ":" .. uLevel
     local db   = MobHealth3_StaticDB
@@ -654,21 +669,52 @@ installBridges = function()
         -- numeric value comes from UnitHealth (server percentage), so the
         -- default text reads "75 / 100" for percentage-only targets.
         --
-        -- Post-hook the update function and rewrite the text widgets with
-        -- our bridged values. hooksecurefunc is taint-safe — the hook
-        -- runs in insecure context after Blizzard's secure call returns,
-        -- so SetText on the FontStrings (which aren't protected widgets)
-        -- doesn't leak back into Blizzard's chain.
+        -- Post-hook BOTH `TextStatusBar_UpdateTextString` and the lower
+        -- `TextStatusBar_UpdateTextStringWithValues`. Coverage matters
+        -- because Blizzard calls UpdateTextStringWithValues directly on
+        -- every SetValue (without going through UpdateTextString), and
+        -- FormatFix happens to hook only that lower function. With just
+        -- the higher hook, FormatFix's raw-value SetText overwrites our
+        -- bridged values on those direct calls — user sees correct text
+        -- for a moment, then it reverts to raw "after a few minutes" as
+        -- HP changes accumulate. Hooking both guarantees we run last in
+        -- whichever path Blizzard uses.
+        --
+        -- hooksecurefunc is taint-safe — the hook runs in insecure
+        -- context after Blizzard's secure call returns, so SetText on
+        -- the FontStrings (which aren't protected widgets) doesn't leak
+        -- back into Blizzard's chain.
+        -- Diagnostic showed ModernTargetFrame anchors TextString behind
+        -- the name banner (hidden), while LeftText and RightText sit at
+        -- the bar edges where they're visible. To get a combined
+        -- "cur / max" display in a visible spot, we use LeftText (which
+        -- we know renders), clear the other two, and re-anchor LeftText
+        -- toward the bar center so the combined string sits where the
+        -- user expects it. RightText/TextString are blanked so they
+        -- don't show duplicates if Blizzard re-shows them.
+        local leftReanchored = false
         local function substituteText(bar)
             if not bar or bar ~= TargetFrameHealthBar or not bar.unit then return end
             local c, m, found = MobHealth3:GetUnitHealth(bar.unit)
             if not found then return end
-            if bar.TextString then bar.TextString:SetText(c .. " / " .. m) end
-            if bar.LeftText  then bar.LeftText:SetText(c) end
-            if bar.RightText then bar.RightText:SetText(m) end
+
+            if bar.LeftText then
+                if not leftReanchored then
+                    bar.LeftText:ClearAllPoints()
+                    bar.LeftText:SetPoint("CENTER", bar, "CENTER", 0, 0)
+                    leftReanchored = true
+                end
+                bar.LeftText:SetText(c .. " / " .. m)
+                bar.LeftText:Show()
+            end
+            if bar.RightText  then bar.RightText:SetText("")  end
+            if bar.TextString then bar.TextString:SetText("") end
         end
         if hooksecurefunc then
             hooksecurefunc("TextStatusBar_UpdateTextString", substituteText)
+            hooksecurefunc("TextStatusBar_UpdateTextStringWithValues", function(bar, val, min, max)
+                substituteText(bar)
+            end)
         end
         bridged = "ModernTargetFrame"
     end
@@ -701,6 +747,9 @@ installBridges = function()
         local fs = container:CreateFontString(
             "MobHealth3StockTargetText", "OVERLAY", "GameFontHighlightSmall")
         fs:SetPoint("CENTER", container, "CENTER", 0, 0)
+        fs:SetFont("Fonts\\ARIALN.TTF", 14, "OUTLINE")
+        fs:SetShadowOffset(0, 0)
+        fs:SetShadowColor(0, 0, 0, .85)
 
         local function refresh()
             local cvar = GetCVar and GetCVar("statusText")
@@ -1057,14 +1106,81 @@ installBridges = function()
         end
 
         local Plater = _G.Plater
-        -- Plater.lua has no `local UnitHealth = UnitHealth` capture,
-        -- so setfenv on QuickHealthUpdate substitutes the env-resolved
-        -- globals cleanly. Covers the initial plate-add path.
+        -- QuickHealthUpdate runs only at NAME_PLATE_UNIT_ADDED (initial
+        -- plate render). Plater.lua has no `local UnitHealth = UnitHealth`
+        -- chunk capture, so setfenv on this one substitutes globals cleanly.
         if type(Plater.QuickHealthUpdate) == "function" then
             local origEnv = getfenv(Plater.QuickHealthUpdate) or _G
             setfenv(Plater.QuickHealthUpdate, setmetatable({
                 UnitHealth    = bridgedHealth,
                 UnitHealthMax = bridgedHealthMax,
+            }, {__index = origEnv}))
+            touched = true
+        end
+
+        -- Plater.OnUpdateHealth runs on every UNIT_HEALTH (called from
+        -- our DF.UpdateHealth replacement via OnHealthChange hook). It
+        -- does several things that fight our bridged values:
+        --   1. Line 5857: redundant `UnitHealthMax(self.displayedUnit)`
+        --      reads raw, OVERWRITES self.currentHealthMax with raw.
+        --   2. Line 5867: captures oldHealth = self.CurrentHealth
+        --      (which may still be the previous raw value).
+        --   3. Line 5921 (animation block): SetValue(oldHealth) sets
+        --      the bar widget back to the old raw value, even though
+        --      DF.UpdateHealth just set it to bridged.
+        --
+        -- Diagnostic confirmed all three: targeted-mob bar showed
+        -- SetValue=100 (raw) with SetMinMaxValues=0..573 (bridged) and
+        -- all cached cur/max fields = 573 (bridged max). The bar value
+        -- disagrees with the cached fields and visually shows wrong fill.
+        --
+        -- setfenv on this function is unreliable across Plater versions,
+        -- so post-wrap and re-apply EVERYTHING the bridged path needs:
+        -- both fields (lower+upper), bar widget value+range, and reset
+        -- IsAnimating so the animation system can't undo our writes on
+        -- the next OnUpdate tick. This makes the final state
+        -- deterministic regardless of what the original did.
+        if type(Plater.OnUpdateHealth) == "function" then
+            local orig = Plater.OnUpdateHealth
+            Plater.OnUpdateHealth = function(self)
+                orig(self)
+                if self and self.displayedUnit then
+                    local cur = bridgedHealth(self.displayedUnit)
+                    local max = bridgedHealthMax(self.displayedUnit)
+                    if max and max > 0 then
+                        self.currentHealth    = cur
+                        self.currentHealthMax = max
+                        self.CurrentHealth    = cur
+                        self.CurrentHealthMax = max
+                        self:SetMinMaxValues(0, max)
+                        self:SetValue(cur)
+                        -- Stop any in-flight animation; otherwise next
+                        -- OnUpdate tick runs AnimateLeft/Right with
+                        -- stale AnimationStart/End and overwrites our
+                        -- value.
+                        self.IsAnimating = false
+                        self.AnimationStart = cur
+                        self.AnimationEnd   = cur
+                    end
+                end
+            end
+            touched = true
+        end
+
+        -- Plater.SetCVarsOnFirstRun (runs 15s after PLAYER_LOGIN on new
+        -- installs) does `SetCVar("nameplateMaxDistance", 41)`. Stock
+        -- Classic Era clients clamp this CVar to 20 in the binary AND
+        -- throw a Lua error on out-of-range values, which aborts the
+        -- rest of Plater's first-run setup — so any user on an unmodded
+        -- client gets a broken Plater that never finishes initializing.
+        -- We sandbox `SetCVar` inside just that one function via setfenv
+        -- so the error gets pcall'd and execution continues. Modded
+        -- clients (Kronos) still accept 41 and benefit normally.
+        if type(Plater.SetCVarsOnFirstRun) == "function" then
+            local origSetCVar = _G.SetCVar
+            local origEnv = getfenv(Plater.SetCVarsOnFirstRun) or _G
+            setfenv(Plater.SetCVarsOnFirstRun, setmetatable({
+                SetCVar = function(...) pcall(origSetCVar, ...) end,
             }, {__index = origEnv}))
             touched = true
         end
