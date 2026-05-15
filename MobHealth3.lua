@@ -986,52 +986,88 @@ installBridges = function()
     end
 
     -- Plater: the actual continuous health updates run inside the
-    -- DetailsFramework health bar metatable, not Plater.lua. Each
-    -- shown nameplate's healthBar has __index = DF_healthBarMetaFunctions
-    -- (a global table DF exposes for exactly this kind of override).
-    -- The relevant methods are UpdateHealth (UNIT_HEALTH event),
-    -- UpdateMaxHealth (UNIT_MAXHEALTH event), and SetUnit (initial
-    -- bind, where the bar reads UnitHealth/UnitHealthMax for the first
-    -- time). All three use env-resolved globals — no `local UnitHealth
-    -- = UnitHealth` capture — so setfenv with a wrapping table
-    -- substitutes bridged versions cleanly. Each method writes the
-    -- resolved values onto self.currentHealth / .currentHealthMax,
-    -- which Plater.UpdateLifePercentText (and user scripts) read for
-    -- display.
+    -- DetailsFramework health bar metatable, exposed at
+    -- _G.DF_healthBarMetaFunctions. Two versions of DF exist in the
+    -- wild — older builds put UpdateHealth/UpdateMaxHealth in
+    -- libs/DF/panel.lua with env-resolved globals (setfenv works);
+    -- newer builds (libs/DF/unitframe.lua) capture
+    -- `local UnitHealth = UnitHealth` at chunk load, so the lookups
+    -- inside the methods are upvalues that setfenv can't reach. WoW
+    -- Classic Era has no `debug` library, so we can't rewrite the
+    -- upvalues either. The reliable cross-version fix is to REPLACE
+    -- the metatable entries outright with our own implementations
+    -- that call bridgedHealth / bridgedHealthMax directly.
     --
-    -- Also patch Plater.QuickHealthUpdate / Plater.OnUpdateHealth —
-    -- they're called from a few less-frequent paths (e.g. when a plate
-    -- first appears via NAME_PLATE_UNIT_ADDED) and also write
-    -- CurrentHealth / CurrentHealthMax (uppercase) cached fields.
+    -- SetUnit reads UnitHealth/UnitHealthMax for the initial value
+    -- only — it's followed immediately by a UNIT_HEALTH/UNIT_MAXHEALTH
+    -- event that fires our replacement UpdateHealth/UpdateMaxHealth,
+    -- so we leave SetUnit alone and let the first event tick correct
+    -- the values.
     --
-    -- Bar fill is already visually correct without bridging (proportion
-    -- preserves whether values are 75/100 or 9000/12000); the bridge is
-    -- for the displayed text and for user scripts that read absolute
-    -- HP. pcall'd so an unexpected internal change in Plater doesn't
-    -- break the install message.
+    -- Plater.QuickHealthUpdate (called from NAME_PLATE_UNIT_ADDED in
+    -- Plater.lua, which does NOT capture UnitHealth as an upvalue) is
+    -- patched via setfenv as a belt-and-braces — covers the initial
+    -- plate-add render before the first UNIT_HEALTH event arrives.
+    --
+    -- Bar fill is already visually correct without bridging (the
+    -- percent ratio 75/100 fills identically to 9000/12000); the
+    -- bridge is for the displayed text and for user scripts that read
+    -- absolute HP. pcall'd so an unexpected internal change in Plater
+    -- doesn't break the install message.
     local platerOk, platerErr = pcall(function()
         if not (IsAddOnLoaded and IsAddOnLoaded("Plater") and _G.Plater) then return end
-        local function bridge(fn)
-            if type(fn) ~= "function" then return false end
-            local origEnv = getfenv(fn) or _G
-            setfenv(fn, setmetatable({
-                UnitHealth    = bridgedHealth,
-                UnitHealthMax = bridgedHealthMax,
-            }, {__index = origEnv}))
-            return true
-        end
-
         local touched = false
+
         local DFHealth = _G.DF_healthBarMetaFunctions
         if DFHealth then
-            if bridge(DFHealth.UpdateHealth)    then touched = true end
-            if bridge(DFHealth.UpdateMaxHealth) then touched = true end
-            if bridge(DFHealth.SetUnit)         then touched = true end
+            -- Replace UpdateHealth and UpdateMaxHealth with bridged
+            -- equivalents. We mirror DF's own behavior (writes
+            -- self.currentHealth / .currentHealthMax, sets bar
+            -- min/max/value, dispatches OnHealthChange /
+            -- OnHealthMaxChange via direct callback or hook). Wrap
+            -- the original via closure so consumers that override
+            -- OnHealthChange / OnHealthMaxChange still see their
+            -- callback fire.
+            DFHealth.UpdateHealth = function(self)
+                self.oldHealth = self.currentHealth
+                local health = bridgedHealth(self.displayedUnit)
+                self.currentHealth = health
+                if _G.PixelUtil then
+                    _G.PixelUtil.SetStatusBarValue(self, health)
+                else
+                    self:SetValue(health)
+                end
+                if (self.OnHealthChange) then
+                    self.OnHealthChange(self, self.displayedUnit)
+                else
+                    self:RunHooksForWidget("OnHealthChange", self, self.displayedUnit)
+                end
+            end
+            DFHealth.UpdateMaxHealth = function(self)
+                local maxHealth = bridgedHealthMax(self.displayedUnit)
+                self:SetMinMaxValues(0, maxHealth)
+                self.currentHealthMax = maxHealth
+                if (self.OnHealthMaxChange) then
+                    self.OnHealthMaxChange(self, self.displayedUnit)
+                else
+                    self:RunHooksForWidget("OnHealthMaxChange", self, self.displayedUnit)
+                end
+            end
+            touched = true
         end
 
         local Plater = _G.Plater
-        if bridge(Plater.QuickHealthUpdate) then touched = true end
-        if bridge(Plater.OnUpdateHealth)    then touched = true end
+        -- Plater.lua has no `local UnitHealth = UnitHealth` capture,
+        -- so setfenv on QuickHealthUpdate substitutes the env-resolved
+        -- globals cleanly. Covers the initial plate-add path.
+        if type(Plater.QuickHealthUpdate) == "function" then
+            local origEnv = getfenv(Plater.QuickHealthUpdate) or _G
+            setfenv(Plater.QuickHealthUpdate, setmetatable({
+                UnitHealth    = bridgedHealth,
+                UnitHealthMax = bridgedHealthMax,
+            }, {__index = origEnv}))
+            touched = true
+        end
 
         if touched then
             nameplateBridged = (nameplateBridged and (nameplateBridged .. " + Plater"))
