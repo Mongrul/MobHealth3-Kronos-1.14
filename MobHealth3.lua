@@ -95,6 +95,32 @@ function GetMH3Cache() return MH3Cache end
 local MobHealth3 = CreateFrame("Frame", "MobHealth3Frame")
 _G.MobHealth3 = MobHealth3
 
+-- RealMobHealth compatibility shim. Several nameplate addons (Kui in
+-- particular, also some WeakAuras) check for a global `RealMobHealth`
+-- and call `RealMobHealth.GetUnitHealth(unit) -> cur, max`. They bind
+-- the reference once at their Initialise/PLAYER_LOGIN, so this shim
+-- has to exist at file-load time — not in installBridges.
+--
+-- If the real RealMobHealth addon is installed, it loads after us
+-- (alphabetical: M < R) and overwrites this table with its own. That's
+-- the right outcome — the real addon is more battle-tested. Our shim
+-- only matters when RealMobHealth isn't installed.
+--
+-- Returns the bridged value when MobHealth has data, or falls through
+-- to the raw server values (percent) when it doesn't, so the caller
+-- never gets nil.
+if not _G.RealMobHealth then
+    _G.RealMobHealth = {
+        GetUnitHealth = function(unit)
+            local c, m, found = MobHealth3:GetUnitHealth(unit)
+            if not found then
+                return origUnitHealth(unit), origUnitHealthMax(unit)
+            end
+            return c, m
+        end,
+    }
+end
+
 -- Kronos sends real HP only for units in your party/raid (and yourself/pet).
 -- Everyone else (target, mouseover, nameplates, enemy players, NPCs) comes
 -- through as a 0..100 percentage with UnitHealthMax ≈ 100. Distinguish by
@@ -1014,6 +1040,16 @@ installBridges = function()
     end)
     if not platerOk then
         DEFAULT_CHAT_FRAME:AddMessage("|cffff0000MobHealth3 Plater bridge error:|r " .. tostring(platerErr))
+    end
+
+    -- Kui Nameplates: has built-in RealMobHealth integration. The
+    -- `_G.RealMobHealth` shim installed at MobHealth3.lua file load
+    -- (above the installBridges definition) supplies its expected
+    -- GetUnitHealth API. Nothing to patch here — this block only
+    -- reports Kui's status in the install message.
+    if IsAddOnLoaded and IsAddOnLoaded("Kui_Nameplates_Core") then
+        nameplateBridged = (nameplateBridged and (nameplateBridged .. " + Kui"))
+                           or "Kui"
     end
 
     local msg = "|cff00ff00MobHealth3:|r "
